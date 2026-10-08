@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Test run: make the video but do NOT upload"
+        description: "TICK = test only (NO upload). Leave UNTICKED to upload."
         type: boolean
-        default: true
+        default: false
+      minutes:
+        description: "Video length in minutes (leave empty for random 5-40). Use 1 for a quick test."
+        type: string
+        default: ""
 
 jobs:
   make-and-upload:
@@ -44,6 +48,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          MIN_MINUTES: ${{ github.event.inputs.minutes || '5' }}
+          MAX_MINUTES: ${{ github.event.inputs.minutes || '40' }}
         run: python main.py
 
       - name: Save test files (dry run only)

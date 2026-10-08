@@ -88,7 +88,7 @@ def fallback_metadata(niche, minutes):
 
 
 def gemini_metadata(niche, minutes):
-    key = os.getenv("GEMINI_API_KEY")
+    key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
         return None
     prompt = f"""You write YouTube metadata for a relaxing instrumental music channel.
@@ -99,19 +99,38 @@ Return ONLY JSON with these keys:
 "description": 3 short paragraphs (what it is, best moments to listen, a friendly call to subscribe), plain text, and a final line "Music is AI-generated.",
 "tags": array of 12 relevant tags,
 "image_prompt": one sentence describing a beautiful calm background picture that matches the genre. Scene: {niche['scene']}. No text, no people's faces, no logos."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    r = requests.post(
-        url, headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-        json={"contents": [{"parts": [{"text": prompt}]}],
-              "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}},
-        timeout=90)
-    r.raise_for_status()
-    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    data = json.loads(text)
-    for k in ("title", "thumbnail_text", "description", "tags", "image_prompt"):
-        if k not in data:
-            raise ValueError(f"missing {k}")
-    return data
+    models = []
+    for m in [GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]:
+        if m and m not in models:
+            models.append(m)
+    last = "no attempt"
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(
+                url, headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"temperature": 1.0}}, timeout=90)
+        except Exception as e:
+            last = f"{model}: {type(e).__name__}"
+            log(f"  Gemini {last}")
+            continue
+        if not r.ok:
+            last = f"{model}: HTTP {r.status_code} {r.text[:250]}"
+            log(f"  Gemini {last}")
+            continue
+        try:
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+            data = json.loads(text)
+            for k in ("title", "thumbnail_text", "description", "tags", "image_prompt"):
+                if k not in data:
+                    raise ValueError(f"missing {k}")
+            return data
+        except Exception as e:
+            last = f"{model}: bad answer ({type(e).__name__})"
+            log(f"  Gemini {last}")
+    raise RuntimeError(last)
 
 
 def get_metadata(niche, minutes):
@@ -123,7 +142,7 @@ def get_metadata(niche, minutes):
             log("No GEMINI_API_KEY, using template metadata")
             data = fallback_metadata(niche, minutes)
     except Exception as e:
-        log(f"Gemini failed ({type(e).__name__}), using template metadata")
+        log(f"Gemini failed, using template metadata. Reason: {e}")
         data = fallback_metadata(niche, minutes)
     data["title"] = re.sub(r"[<>]", "", str(data["title"]))[:95].strip()
     data["description"] = str(data["description"])[:4500]
@@ -319,35 +338,63 @@ def upload(video_path, thumb_path, meta):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
 
-    creds = Credentials(None, refresh_token=os.environ["YT_REFRESH_TOKEN"],
+    creds = Credentials(None, refresh_token=os.environ["YT_REFRESH_TOKEN"].strip(),
                         token_uri="https://oauth2.googleapis.com/token",
-                        client_id=os.environ["YT_CLIENT_ID"],
-                        client_secret=os.environ["YT_CLIENT_SECRET"],
-                        scopes=["https://www.googleapis.com/auth/youtube.upload"])
-    creds.refresh(Request())
+                        client_id=os.environ["YT_CLIENT_ID"].strip(),
+                        client_secret=os.environ["YT_CLIENT_SECRET"].strip())
+    try:
+        creds.refresh(Request())
+    except Exception as e:
+        raise RuntimeError("Google login failed. Re-check the secrets YT_CLIENT_ID, "
+                           "YT_CLIENT_SECRET and YT_REFRESH_TOKEN (create a new token "
+                           f"with get_token.py). Details: {e}")
+    log("Google login OK")
     yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
-    body = {
-        "snippet": {"title": meta["title"], "description": meta["description"],
-                    "tags": meta["tags"], "categoryId": "10"},
-        "status": {"privacyStatus": PRIVACY, "selfDeclaredMadeForKids": False,
-                   "containsSyntheticMedia": True},
-    }
-    media = MediaFileUpload(str(video_path), chunksize=8 * 1024 * 1024, resumable=True)
-    req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
-    resp = None
-    while resp is None:
-        status, resp = req.next_chunk()
-        if status:
-            log(f"  uploaded {int(status.progress() * 100)}%")
+    try:
+        ch = yt.channels().list(part="snippet", mine=True).execute()
+        names = [c["snippet"]["title"] for c in ch.get("items", [])]
+        log(f"Uploading to channel: {', '.join(names) or 'unknown'}")
+    except Exception:
+        log("Could not read channel name (not a problem)")
+
+    def make_body(synthetic):
+        status = {"privacyStatus": PRIVACY, "selfDeclaredMadeForKids": False}
+        if synthetic:
+            status["containsSyntheticMedia"] = True
+        return {"snippet": {"title": meta["title"], "description": meta["description"],
+                            "tags": meta["tags"], "categoryId": "10"}, "status": status}
+
+    def run_upload(body):
+        media = MediaFileUpload(str(video_path), chunksize=8 * 1024 * 1024, resumable=True)
+        req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+        resp = None
+        while resp is None:
+            status, resp = req.next_chunk()
+            if status:
+                log(f"  uploaded {int(status.progress() * 100)}%")
+        return resp
+
+    try:
+        try:
+            resp = run_upload(make_body(True))
+        except HttpError as e:
+            if e.resp.status == 400:
+                log("YouTube rejected the AI label field, retrying without it")
+                resp = run_upload(make_body(False))
+            else:
+                raise
+    except HttpError as e:
+        raise RuntimeError(f"YouTube upload failed: HTTP {e.resp.status} {e.content[:400]}")
     vid = resp["id"]
-    log(f"Uploaded: https://youtu.be/{vid}")
+    log(f"UPLOADED: https://youtu.be/{vid}  (privacy: {resp.get('status', {}).get('privacyStatus')})")
     try:
         yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(str(thumb_path))).execute()
         log("Thumbnail set OK")
     except Exception as e:
-        log(f"Thumbnail failed (is your channel verified?): {type(e).__name__}")
+        log(f"Thumbnail not set (channel needs phone verification at youtube.com/verify): {type(e).__name__}")
     return vid
 
 

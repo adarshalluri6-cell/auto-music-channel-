@@ -1,0 +1,55 @@
+name: Make and upload music video
+
+on:
+  schedule:
+    - cron: "30 3 * * *"    # 09:00 IST
+    - cron: "30 13 * * *"   # 19:00 IST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Test run: make the video but do NOT upload"
+        type: boolean
+        default: true
+
+jobs:
+  make-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg and fonts
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Install Python packages
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Cache the MusicGen model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-musicgen-small-v1
+
+      - name: Generate and upload
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python main.py
+
+      - name: Save test files (dry run only)
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: output/
+          retention-days: 3

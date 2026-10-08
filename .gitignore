@@ -1,0 +1,9 @@
+client_secret.json
+client_secret*.json
+*.env
+.env
+output/
+__pycache__/
+*.wav
+*.mp4
+token.json
